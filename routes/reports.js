@@ -1,0 +1,134 @@
+const router = require('express').Router();
+const { pool } = require('../db');
+const { requireAuth } = require('../utils/requireAuth');
+
+// ---------- helpers de fecha ----------
+function ymd(d = new Date()) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function buildRange(query) {
+  const from = (query.from || ymd()).trim();
+  const to = (query.to || from).trim();
+  const method = (query.method || 'ALL').toUpperCase();
+  // rangos cerrados por día
+  const fromStart = `${from} 00:00:00`;
+  const toEnd = `${to} 23:59:59`;
+  return { from, to, fromStart, toEnd, method };
+}
+
+// =========================
+//      REPORTES CORE
+// =========================
+
+// Ocupación: abierta a cualquier usuario autenticado
+router.get('/occupancy', requireAuth(), async (_req, res) => {
+  const [[open]] = await pool.query(`SELECT COUNT(*) AS openTickets FROM Ticket WHERE status='OPEN'`);
+  const [[cfg]] = await pool.query(`SELECT total_spots FROM Settings WHERE id=1`);
+  const occupied = open.openTickets;
+  const total = cfg?.total_spots || 0;
+  res.json({ total, occupied, free: Math.max(0, total - occupied), rate: total ? occupied / total : 0 });
+});
+
+// Ingresos simples (compat) — usa createdAt y roles altos
+router.get('/revenue', requireAuth(['ADMIN', 'SUPERVISOR']), async (req, res) => {
+  const { fromStart, toEnd } = buildRange(req.query);
+  const [rows] = await pool.query(
+    `SELECT method, SUM(amount) AS total
+       FROM Payment
+      WHERE createdAt BETWEEN ? AND ?
+      GROUP BY method
+      ORDER BY total DESC`,
+    [fromStart, toEnd]
+  );
+  res.json(rows);
+});
+
+// =========================
+//   ENDPOINTS PARA FRONT
+// =========================
+
+// 1) Resumen de pagos (total, cantidad, promedios)
+router.get('/payments/summary', requireAuth(['ADMIN', 'SUPERVISOR']), async (req, res) => {
+  const { fromStart, toEnd, method } = buildRange(req.query);
+
+  // Nota: count = tickets (distinct) para coincidir con el front.
+  const [rows] = await pool.query(
+    `
+    SELECT
+      COALESCE(SUM(p.amount), 0)                         AS total,
+      COUNT(DISTINCT p.ticketId)                         AS tickets,
+      COALESCE(AVG(t.minutes), 0)                        AS avgMinutes,
+      CASE WHEN COUNT(DISTINCT p.ticketId) = 0
+           THEN 0
+           ELSE COALESCE(SUM(p.amount) / COUNT(DISTINCT p.ticketId), 0)
+      END                                                AS avgTicket
+    FROM Payment p
+    JOIN Ticket  t ON t.id = p.ticketId
+    WHERE p.createdAt BETWEEN ? AND ?
+      AND (? = 'ALL' OR p.method = ?)
+    `,
+    [fromStart, toEnd, method, method]
+  );
+
+  const r = rows[0] || { total: 0, tickets: 0, avgMinutes: 0, avgTicket: 0 };
+  res.json({
+    total: Number(r.total || 0),
+    count: Number(r.tickets || 0),         // <- el front espera "count" (tickets cerrados)
+    avgTicket: Number(r.avgTicket || 0),
+    avgMinutes: Number(r.avgMinutes || 0),
+  });
+});
+
+// 2) Totales por método en el rango
+router.get('/payments/by-method', requireAuth(['ADMIN', 'SUPERVISOR']), async (req, res) => {
+  const { fromStart, toEnd } = buildRange(req.query);
+  const [rows] = await pool.query(
+    `
+    SELECT p.method,
+           COUNT(*)               AS count,
+           COALESCE(SUM(p.amount), 0) AS total
+    FROM Payment p
+    WHERE p.createdAt BETWEEN ? AND ?
+    GROUP BY p.method
+    ORDER BY total DESC
+    `,
+    [fromStart, toEnd]
+  );
+  // asegurar números puros
+  const data = rows.map(r => ({
+    method: r.method,
+    count: Number(r.count || 0),
+    total: Number(r.total || 0),
+  }));
+  res.json(data);
+});
+
+// 3) Evolución diaria (total por día dentro del rango)
+router.get('/payments/daily', requireAuth(['ADMIN', 'SUPERVISOR']), async (req, res) => {
+  const { fromStart, toEnd, method } = buildRange(req.query);
+  const [rows] = await pool.query(
+    `
+    SELECT DATE(p.createdAt) AS date,
+           COALESCE(SUM(p.amount), 0) AS total,
+           COUNT(*) AS count
+    FROM Payment p
+    WHERE p.createdAt BETWEEN ? AND ?
+      AND (? = 'ALL' OR p.method = ?)
+    GROUP BY DATE(p.createdAt)
+    ORDER BY DATE(p.createdAt)
+    `,
+    [fromStart, toEnd, method, method]
+  );
+  const data = rows.map(r => ({
+    date: r.date,                             // 'YYYY-MM-DD'
+    total: Number(r.total || 0),
+    count: Number(r.count || 0),
+  }));
+  res.json(data);
+});
+
+module.exports = router;
