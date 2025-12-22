@@ -62,9 +62,11 @@ app.use(
     origin: (origin, cb) => {
       // allow non-browser clients (curl/postman) with no Origin header
       if (!origin) return cb(null, true);
-      return originAllowed(origin)
-        ? cb(null, true)
-        : cb(new Error(`CORS blocked for origin: ${origin}`));
+
+      // IMPORTANT: do not throw errors from CORS middleware.
+      // If origin is not allowed, we simply don't set CORS headers.
+      // Browsers will block it, but the server won't return 500.
+      return originAllowed(origin) ? cb(null, true) : cb(null, false);
     },
     credentials: true
   })
@@ -82,18 +84,37 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
+function safeMount(prefix, modulePath) {
+  try {
+    // eslint-disable-next-line global-require, import/no-dynamic-require
+    const r = require(modulePath);
+    app.use(prefix, r);
+  } catch (e) {
+    console.error(`[boot] Failed to mount ${modulePath} on ${prefix}:`, e);
+    app.use(prefix, (_req, res) => {
+      res.status(500).json({ ok: false, error: `Boot error mounting ${modulePath}` });
+    });
+  }
+}
+
 // Rutas bajo /api
-app.use('/api/auth', require('./routes/auth'));
-app.use('/api/settings', require('./routes/settings'));
-app.use('/api/rateplans', require('./routes/rateplans'));
-app.use('/api/tickets', require('./routes/tickets'));
-app.use('/api/payments', require('./routes/payments'));
-app.use('/api/reports', require('./routes/reports'));
-app.use('/api/subscribers', require('./routes/subscribers'));
-app.use('/api/cash-shifts', require('./routes/cashShift'));
+safeMount('/api/auth', './routes/auth');
+safeMount('/api/settings', './routes/settings');
+safeMount('/api/rateplans', './routes/rateplans');
+safeMount('/api/tickets', './routes/tickets');
+safeMount('/api/payments', './routes/payments');
+safeMount('/api/reports', './routes/reports');
+safeMount('/api/subscribers', './routes/subscribers');
+safeMount('/api/cash-shifts', './routes/cashShift');
 
 // Static público
 app.use('/public', express.static('public'));
-app.use('/public', require('./routes/public'));
+safeMount('/public', './routes/public');
+
+// Global error handler (loggea en Runtime Logs)
+app.use((err, _req, res, _next) => {
+  console.error('[express error]', err);
+  res.status(500).json({ ok: false, error: String(err?.message || err) });
+});
 
 module.exports = app;

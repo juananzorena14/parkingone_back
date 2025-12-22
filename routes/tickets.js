@@ -1,6 +1,13 @@
 const router = require('express').Router();
-const { nanoid } = require('nanoid');
+const crypto = require('crypto');
 const { pool } = require('../db');
+
+function shortId(size = 10) {
+  // nanoid v5 is ESM-only; in Vercel (CommonJS) require('nanoid') crashes.
+  // This generates a URL-safe id similar to nanoid.
+  const bytes = Math.ceil(size * 3 / 4);
+  return crypto.randomBytes(bytes).toString('base64url').slice(0, size);
+}
 const { calcAmount } = require('../utils/calcAmount');
 const { requireAuth } = require('../utils/requireAuth');
 const { isValidPaymentMethod, normalizePaymentMethod } = require('../utils/paymentMethod');
@@ -22,7 +29,7 @@ router.post('/',requireAuth(), async (req,res)=>{
   const { plate, vehicleType, ratePlanId, createdBy } = req.body;
   const p = normPlate(plate);
   const checkInAt = new Date();
-  const entryCode = "T" + nanoid(10); 
+  const entryCode = "T" + shortId(10); 
 
   // ¿Es abonado? (traemos última suscripción para decidir si está al día)
   const [[sub]] = await pool.query(
