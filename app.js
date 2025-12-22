@@ -75,7 +75,11 @@ app.use(helmet());
 
 // Health (para chequear rápido si la Function levanta)
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, at: new Date().toISOString() });
+  res.json({
+    ok: true,
+    at: new Date().toISOString(),
+    dbConfigured: Boolean(process.env.DATABASE_URL),
+  });
 });
 
 // Rutas bajo /api
