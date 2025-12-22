@@ -12,7 +12,7 @@ router.get('/tickets/:code/summary', async (req, res) => {
   const [[row]] = await pool.query(
     `SELECT 
         t.id, t.plate, t.vehicleType, t.checkInAt, t.status, t.entryCode,
-        rp.id AS ratePlanId, rp.name AS rateName, rp.base, rp.perHour, rp.per15min,
+        rp.id AS ratePlanId, rp.name AS rateName, rp.base, rp.perHour, rp.per30min, rp.per15min,
         rp.toleranceMin, rp.nightFlat, rp.nightStartsAt, rp.nightEndsAt, rp.currency
      FROM Ticket t
      JOIN RatePlan rp ON rp.id = t.ratePlanId
@@ -25,7 +25,10 @@ router.get('/tickets/:code/summary', async (req, res) => {
   let parkingName = 'Estacionamiento';
   let tz = null;
   try {
-    const [[cfg]] = await pool.query(`SELECT name, timezone FROM Settings WHERE id=1`);
+    // DB schema uses Settings.parking_name
+    const [[cfg]] = await pool.query(
+      `SELECT parking_name AS name, timezone FROM Settings WHERE id=1`
+    );
     if (cfg) {
       parkingName = cfg.name || parkingName;
       tz = cfg.timezone || tz;
@@ -36,7 +39,9 @@ router.get('/tickets/:code/summary', async (req, res) => {
 
   // 3) Cálculo en vivo
   const now = new Date();
-  const minutes = Math.max(1, dayjs(now).diff(dayjs(row.checkInAt), 'minute'));
+
+  // Igual que en checkout: diff('minute') es floor, usamos float + ceil
+  const minutes = Math.max(1, Math.ceil(dayjs(now).diff(dayjs(row.checkInAt), 'minute', true)));
   const amount = calcAmount(minutes, row, now);
 
   res.json({
@@ -55,6 +60,7 @@ router.get('/tickets/:code/summary', async (req, res) => {
       name: row.rateName,
       base: Number(row.base || 0),
       perHour: row.perHour != null ? Number(row.perHour) : null,
+      per30min: row.per30min != null ? Number(row.per30min) : null,
       per15min: row.per15min != null ? Number(row.per15min) : null,
       toleranceMin: row.toleranceMin != null ? Number(row.toleranceMin) : 0,
       nightFlat: row.nightFlat != null ? Number(row.nightFlat) : null,

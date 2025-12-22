@@ -25,28 +25,31 @@ function requireAuth(roles = []) {
  * - Si hay roles definidos, los aplica solo si existe usuario.
  */
 requireAuth.optional = (roles = []) => {
-  return async (req, res, next) => {
+  return (req, res, next) => {
     try {
       const authHeader = req.headers.authorization || '';
       const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
 
+      // If this route requires roles, do NOT allow anonymous access.
       if (!token) {
         req.user = null;
-        return next(); // sin token → acceso permitido pero sin user
+        if (roles.length) return res.status(401).json({ error: 'No token' });
+        return next();
       }
 
-      const decoded = jwt.verify(token, SECRET);
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
       req.user = decoded;
 
       if (roles.length && !roles.includes(req.user.role)) {
-        return res.status(403).json({ error: 'unauthorized' });
+        return res.status(403).json({ error: 'Forbidden' });
       }
 
-      next();
+      return next();
     } catch (err) {
-      console.warn('[requireAuth.optional]', err.message);
-      req.user = null; // token inválido o expirado
-      next(); // deja pasar igual
+      // If roles are required, reject invalid tokens.
+      if (roles.length) return res.status(401).json({ error: 'Invalid token' });
+      req.user = null;
+      return next();
     }
   };
 };

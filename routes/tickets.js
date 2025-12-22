@@ -3,6 +3,7 @@ const { nanoid } = require('nanoid');
 const { pool } = require('../db');
 const { calcAmount } = require('../utils/calcAmount');
 const { requireAuth } = require('../utils/requireAuth');
+const { isValidPaymentMethod, normalizePaymentMethod } = require('../utils/paymentMethod');
 const dayjs = require("dayjs");
 
 function normPlate(p){ return (p||'').trim().toUpperCase().replace(/\s+/g,''); }
@@ -23,38 +24,59 @@ router.post('/',requireAuth(), async (req,res)=>{
   const checkInAt = new Date();
   const entryCode = "T" + nanoid(10); 
 
-  // ¿Es abonado activo?
-  const [[sub]] = await pool.query(`
-  SELECT 
-    s.id AS subscriberId,
-    s.status,
-    s.vehicleType AS subVehicleType,
-    (
-      SELECT MAX(x.nextDueDate)
-      FROM Subscription x
-      WHERE x.subscriberId = s.id
-    ) AS nextDueDate
-  FROM Subscriber s
-  WHERE s.plate = ? AND s.status = 'ACTIVE'
-  LIMIT 1
-  `, [p]);
-
-  if (sub) {
-  const vtype = vehicleType || sub.subVehicleType || 'CAR'; // nunca null
-
-  const [r] = await pool.query(
-    `INSERT INTO Ticket (plate, vehicleType, ratePlanId, subscriberId, isSubscription, createdBy, checkInAt, entryCode, status)
-     VALUES (?,?,?,?,?,?,?,?,'OPEN')`,
-    [p, vtype, null, sub.subscriberId, 1, createdBy||null, checkInAt, entryCode]
+  // ¿Es abonado? (traemos última suscripción para decidir si está al día)
+  const [[sub]] = await pool.query(
+    `SELECT
+      s.id AS subscriberId,
+      s.status,
+      s.vehicleType AS subVehicleType,
+      ss.nextDueDate,
+      ss.status AS subStatus
+     FROM Subscriber s
+     LEFT JOIN Subscription ss
+       ON ss.id = (
+         SELECT id
+           FROM Subscription
+          WHERE subscriberId = s.id
+          ORDER BY nextDueDate DESC, id DESC
+          LIMIT 1
+       )
+     WHERE s.plate = ? AND s.status = 'ACTIVE'
+     LIMIT 1`,
+    [p]
   );
 
-  // (opcional) calcular si está vencido
-  const [[{ today }]] = await pool.query(`SELECT CURDATE() AS today`);
-  const pastDue = sub.nextDueDate && sub.nextDueDate < today;
+  if (sub) {
+    const vtype = vehicleType || sub.subVehicleType || 'CAR'; // nunca null
 
-  const [[row]] = await pool.query(`SELECT * FROM Ticket WHERE id=?`, [r.insertId]);
-  return res.json({ ok:true, data:{ ...row, isSubscription:1, subscriptionWarning: pastDue ? 'PAST_DUE' : null } });
-}
+    const [[{ today }]] = await pool.query(`SELECT CURDATE() AS today`);
+    const pastDue = (!sub.nextDueDate || sub.subStatus !== 'ACTIVE' || sub.nextDueDate < today);
+
+    // Regla: si está vencido, permite ingreso pero cobra normal => ticket NO es suscripción
+    const isSubscription = pastDue ? 0 : 1;
+
+    // Si vence, debe venir ratePlanId para cobrar normal
+    const rpId = pastDue ? (ratePlanId || null) : null;
+    if (pastDue && !rpId) {
+      return res.status(400).json({ error: 'Abonado vencido: se requiere ratePlanId para cobrar normal.' });
+    }
+
+    const [r] = await pool.query(
+      `INSERT INTO Ticket (plate, vehicleType, ratePlanId, subscriberId, isSubscription, createdBy, checkInAt, entryCode, status)
+       VALUES (?,?,?,?,?,?,?,?,'OPEN')`,
+      [p, vtype, rpId, sub.subscriberId, isSubscription, createdBy||null, checkInAt, entryCode]
+    );
+
+    const [[row]] = await pool.query(`SELECT * FROM Ticket WHERE id=?`, [r.insertId]);
+    return res.json({
+      ok:true,
+      data:{
+        ...row,
+        isSubscription,
+        subscriptionWarning: pastDue ? 'PAST_DUE' : null
+      }
+    });
+  }
 
   // No abonado → flujo normal (usa RatePlan)
   const [r] = await pool.query(
@@ -70,112 +92,330 @@ router.post('/',requireAuth(), async (req,res)=>{
   res.json(ticket);
 });
 
-router.post('/:id/checkout',requireAuth(), async (req,res)=>{
-  const id = Number(req.params.id);               
-  const {method, amountGiven} = req.body || {};
+router.post('/:id/checkout', requireAuth(), async (req, res) => {
+  const id = Number(req.params.id);
+  const body = req.body || {};
   const userId = req.user?.id || null;
 
-  // Validación mínima
   if (!id) return res.status(400).json({ error: 'ID inválido' });
-  const METHOD_OK = ['CASH', 'DEBIT', 'CREDIT', 'MP'];
-  if (!METHOD_OK.includes(method)) {
-    return res.status(400).json({ error: 'Método de pago inválido' });
+
+  const METHOD_OK = ['CASH', 'DEBIT', 'CREDIT', 'TRANSFER'];
+
+  function normalizePayments(input, amountDue) {
+    // New format: payments: [{ method, amount, amountGiven?, externalId?, note? }]
+    if (Array.isArray(input?.payments) && input.payments.length) {
+      return input.payments;
+    }
+
+    // Back-compat: { method, amountGiven } assumes full payment.
+    if (input?.method) {
+      const method = String(input.method || '').toUpperCase();
+      if (!METHOD_OK.includes(method) || !isValidPaymentMethod(method)) throw new Error('Método de pago inválido');
+      const p = { method, amount: Number(amountDue) };
+      if (method === 'CASH') p.amountGiven = input.amountGiven;
+      return [p];
+    }
+
+    throw new Error('Debe enviar payments[] o method');
+  }
+
+  function validateAndPreparePayment(p) {
+    const method = String(p?.method || '').toUpperCase();
+    if (!METHOD_OK.includes(method) || !isValidPaymentMethod(method)) throw new Error('Método de pago inválido');
+
+    const amount = Number(p?.amount);
+    if (!Number.isFinite(amount) || amount <= 0) throw new Error('Importe inválido');
+
+    let amountGiven = null;
+    let changeAmt = null;
+
+    if (method === 'CASH') {
+      if (p?.amountGiven != null && p.amountGiven !== '') {
+        amountGiven = Number(p.amountGiven);
+        if (!Number.isFinite(amountGiven) || amountGiven < amount) {
+          throw new Error('Importe recibido insuficiente');
+        }
+        changeAmt = +(amountGiven - amount);
+      }
+    }
+
+    return {
+      method,
+      amount,
+      amountGiven,
+      changeAmt,
+      externalId: p?.externalId || null,
+      note: p?.note || null,
+    };
+  }
+
+  async function reconcileTicket(conn, ticketId, actorUserId) {
+    const [[t2]] = await conn.query('SELECT * FROM Ticket WHERE id=? FOR UPDATE', [ticketId]);
+    if (!t2) throw new Error('Ticket no encontrado');
+
+    const [[{ totalPaid }]] = await conn.query(
+      `SELECT COALESCE(SUM(amount),0) AS totalPaid FROM Payment WHERE ticketId=?`,
+      [ticketId]
+    );
+
+    const due = Number(t2.amount || 0);
+    const paid = Number(totalPaid || 0);
+
+    if (paid >= due) {
+      await conn.query(
+        `UPDATE Ticket SET status='CLOSED', closedBy=COALESCE(closedBy, ?) WHERE id=?`,
+        [actorUserId, ticketId]
+      );
+      return { status: 'CLOSED', totalPaid: paid, balance: +(due - paid) };
+    }
+
+    await conn.query(
+      `UPDATE Ticket SET status='PAYMENT_PENDING', closedBy=NULL WHERE id=?`,
+      [ticketId]
+    );
+    return { status: 'PAYMENT_PENDING', totalPaid: paid, balance: +(due - paid) };
   }
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
 
-    // 1) Ticket con lock
-    const [[t]] = await conn.query('SELECT * FROM Ticket WHERE id=? FOR UPDATE',[id]);
-    if (!t) { await conn.rollback(); return res.status(404).json({ error:'Ticket no encontrado' }); }
-    if (t.status === 'CLOSED') { await conn.rollback(); return res.status(400).json({ error:'Ticket ya cerrado' }); }
+    const [[t]] = await conn.query('SELECT * FROM Ticket WHERE id=? FOR UPDATE', [id]);
+    if (!t) { await conn.rollback(); return res.status(404).json({ error: 'Ticket no encontrado' }); }
+    if (t.status === 'CLOSED') { await conn.rollback(); return res.status(400).json({ error: 'Ticket ya cerrado' }); }
 
-    // después de leer Ticket t y validar status...
+    // Subscription tickets: always close with amount 0 (no Payment row)
     if (t.isSubscription) {
-      // cierra ticket con monto 0
       const now = new Date();
-      const minutes = Math.max(1, Math.ceil((now - new Date(t.checkInAt))/60000));
-      
+      const minutes = Math.max(1, Math.ceil((now - new Date(t.checkInAt)) / 60000));
+
       await conn.query(
-        `UPDATE Ticket SET checkOutAt=?, minutes=?, amount=?, status='CLOSED' WHERE id=?`,
+        `UPDATE Ticket
+            SET checkOutAt=?, minutes=?, amount=?, status='CLOSED', closedBy=?
+          WHERE id=?`,
         [now, minutes, 0, userId, t.id]
-      );
-      // registra pago 0 para estadística (método SUBSCRIPTION)
-      await conn.query(
-        `INSERT INTO Payment (ticketId, method, amount, createdBy) VALUES (?,?,?,?)`,
-        [t.id, 'SUBSCRIPTION', 0, userId]
       );
 
       await conn.commit();
-
       return res.json({
-        ok:true,
+        ok: true,
         ticketId: t.id,
         amount: 0,
         minutes,
-        method: 'SUBSCRIPTION',
-        amountGiven: null,
-        change: 0,
+        status: 'CLOSED',
+        totalPaid: 0,
+        balance: 0,
         closedAt: now.toISOString(),
-        receiptCode: null
       });
     }
 
-    // a2) Rate plan
-    const [[rp]] = await conn.query('SELECT * FROM RatePlan WHERE id=?',[t.ratePlanId]);
-    if (!rp) { await conn.rollback(); return res.status(400).json({ error:'RatePlan inválido' }); }
-
-    // a3) Calcular monto
-    const checkIn = dayjs(t.checkInAt);
-    const checkOut = dayjs();
-    const minutes = Math.max(1, checkOut.diff(checkIn,'minute'));
-    const amount = calcAmount(minutes, rp, checkOut.toDate());
-
-    // a4) Validar efectivo
-    let given = null, changeAmt = null;
-    if (method === 'CASH') {
-      given = Number(amountGiven ?? 0);
-      if (!Number.isFinite(given) || given < amount) {
-        await conn.rollback();
-        return res.status(400).json({ error:'Importe recibido insuficiente' });
-      }
-      changeAmt = +(given - amount);
+    // Only allow initial checkout from OPEN. Further payments must use POST /tickets/:id/payments.
+    if (t.status !== 'OPEN') {
+      await conn.rollback();
+      return res.status(400).json({ error: 'Ticket ya está en checkout. Usá pagos adicionales para completar.' });
     }
 
-    // a5) Actualizar ticket
+    const [[rp]] = await conn.query('SELECT * FROM RatePlan WHERE id=?', [t.ratePlanId]);
+    if (!rp) { await conn.rollback(); return res.status(400).json({ error: 'RatePlan inválido' }); }
+
+    const checkIn = dayjs(t.checkInAt);
+    const checkOut = dayjs();
+
+    // Importante: dayjs.diff(..., 'minute') redondea hacia abajo.
+    // Para que "pasada la tolerancia" se cobre correctamente, usamos diff en float + ceil.
+    const minutes = Math.max(1, Math.ceil(checkOut.diff(checkIn, 'minute', true)));
+    const amountDue = Number(calcAmount(minutes, rp, checkOut.toDate()) || 0);
+
+    // Freeze checkout time/amount
     await conn.query(
       `UPDATE Ticket
-         SET checkOutAt=?, minutes=?, amount=?, status='CLOSED', closedBy=?
+         SET checkOutAt=?, minutes=?, amount=?
        WHERE id=?`,
-      [checkOut.format('YYYY-MM-DD HH:mm:ss'), minutes, amount, userId, id]
+      [checkOut.format('YYYY-MM-DD HH:mm:ss'), minutes, amountDue, id]
     );
 
-    // a6) Registrar pago (ahora con amountGiven y changeAmt)
-    const [p] = await conn.query(
-      `INSERT INTO Payment (ticketId, method, amount, amountGiven, changeAmt, createdBy)
-       VALUES (?,?,?,?,?,?)`,
-      [id, method, amount, given, changeAmt, userId]
-    );
+    // If amountDue is 0, close without payments
+    if (amountDue <= 0) {
+      await conn.query(
+        `UPDATE Ticket SET status='CLOSED', closedBy=? WHERE id=?`,
+        [userId, id]
+      );
+      await conn.commit();
+      return res.json({
+        ok: true,
+        ticketId: id,
+        amount: amountDue,
+        minutes,
+        status: 'CLOSED',
+        totalPaid: 0,
+        balance: 0,
+        closedAt: checkOut.toISOString(),
+      });
+    }
+
+    let payLines;
+    try {
+      payLines = normalizePayments(body, amountDue).map(validateAndPreparePayment);
+    } catch (e) {
+      await conn.rollback();
+      return res.status(400).json({ error: String(e.message || e) });
+    }
+
+    const totalPayThisRequest = payLines.reduce((s, p) => s + Number(p.amount || 0), 0);
+    if (!Number.isFinite(totalPayThisRequest) || totalPayThisRequest <= 0) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'Debe registrar al menos un pago.' });
+    }
+
+    // Insert all payments
+    const paymentIds = [];
+    for (const p of payLines) {
+      const [r] = await conn.query(
+        `INSERT INTO Payment (ticketId, method, amount, amountGiven, changeAmt, externalId, createdBy, note)
+         VALUES (?,?,?,?,?,?,?,?)`,
+        [id, p.method, p.amount, p.amountGiven, p.changeAmt, p.externalId, userId, p.note]
+      );
+      paymentIds.push(r.insertId);
+    }
+
+    const r = await reconcileTicket(conn, id, userId);
 
     await conn.commit();
 
     return res.json({
       ok: true,
       ticketId: id,
-      amount,
+      amount: amountDue,
       minutes,
-      method,
-      amountGiven: given,
-      change: changeAmt ?? 0,
-      paymentId: p.insertId,
-      closedAt: checkOut.toISOString(),
+      status: r.status,
+      totalPaid: r.totalPaid,
+      balance: r.balance,
+      paymentIds,
+      checkedOutAt: checkOut.toISOString(),
     });
-  }catch(e){
+  } catch (e) {
     await conn.rollback();
     console.error('[checkout error]', e);
-    return res.status(500).json({ error:'Error en checkout' });
-  }finally{
+    return res.status(500).json({ error: 'Error en checkout' });
+  } finally {
+    conn.release();
+  }
+});
+
+// Agregar pagos a un ticket ya checkouteado (PAYMENT_PENDING)
+router.post('/:id/payments', requireAuth(), async (req, res) => {
+  const id = Number(req.params.id);
+  const body = req.body || {};
+  const userId = req.user?.id || null;
+
+  if (!id) return res.status(400).json({ error: 'ID inválido' });
+
+  const METHOD_OK = ['CASH', 'DEBIT', 'CREDIT', 'TRANSFER'];
+
+  function validateAndPreparePayment(p) {
+    const method = String(p?.method || '').toUpperCase();
+    if (!METHOD_OK.includes(method) || !isValidPaymentMethod(method)) throw new Error('Método de pago inválido');
+
+    const amount = Number(p?.amount);
+    if (!Number.isFinite(amount) || amount <= 0) throw new Error('Importe inválido');
+
+    let amountGiven = null;
+    let changeAmt = null;
+
+    if (method === 'CASH') {
+      if (p?.amountGiven != null && p.amountGiven !== '') {
+        amountGiven = Number(p.amountGiven);
+        if (!Number.isFinite(amountGiven) || amountGiven < amount) {
+          throw new Error('Importe recibido insuficiente');
+        }
+        changeAmt = +(amountGiven - amount);
+      }
+    }
+
+    return {
+      method,
+      amount,
+      amountGiven,
+      changeAmt,
+      externalId: p?.externalId || null,
+      note: p?.note || null,
+    };
+  }
+
+  async function reconcileTicket(conn, ticketId, actorUserId) {
+    const [[t2]] = await conn.query('SELECT * FROM Ticket WHERE id=? FOR UPDATE', [ticketId]);
+    if (!t2) throw new Error('Ticket no encontrado');
+
+    const [[{ totalPaid }]] = await conn.query(
+      `SELECT COALESCE(SUM(amount),0) AS totalPaid FROM Payment WHERE ticketId=?`,
+      [ticketId]
+    );
+
+    const due = Number(t2.amount || 0);
+    const paid = Number(totalPaid || 0);
+
+    if (paid >= due) {
+      await conn.query(
+        `UPDATE Ticket SET status='CLOSED', closedBy=COALESCE(closedBy, ?) WHERE id=?`,
+        [actorUserId, ticketId]
+      );
+      return { status: 'CLOSED', totalPaid: paid, balance: +(due - paid) };
+    }
+
+    await conn.query(
+      `UPDATE Ticket SET status='PAYMENT_PENDING', closedBy=NULL WHERE id=?`,
+      [ticketId]
+    );
+    return { status: 'PAYMENT_PENDING', totalPaid: paid, balance: +(due - paid) };
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [[t]] = await conn.query('SELECT * FROM Ticket WHERE id=? FOR UPDATE', [id]);
+    if (!t) { await conn.rollback(); return res.status(404).json({ error: 'Ticket no encontrado' }); }
+    if (t.status === 'CLOSED') { await conn.rollback(); return res.status(400).json({ error: 'Ticket ya cerrado' }); }
+    if (t.status !== 'PAYMENT_PENDING') {
+      await conn.rollback();
+      return res.status(400).json({ error: 'El ticket no está pendiente de pago.' });
+    }
+
+    if (!t.checkOutAt || t.amount == null) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'El ticket no tiene checkout registrado.' });
+    }
+
+    let p;
+    try {
+      p = validateAndPreparePayment(body);
+    } catch (e) {
+      await conn.rollback();
+      return res.status(400).json({ error: String(e.message || e) });
+    }
+
+    const [r] = await conn.query(
+      `INSERT INTO Payment (ticketId, method, amount, amountGiven, changeAmt, externalId, createdBy, note)
+       VALUES (?,?,?,?,?,?,?,?)`,
+      [id, p.method, p.amount, p.amountGiven, p.changeAmt, p.externalId, userId, p.note]
+    );
+
+    const rr = await reconcileTicket(conn, id, userId);
+
+    await conn.commit();
+    return res.json({
+      ok: true,
+      ticketId: id,
+      paymentId: r.insertId,
+      status: rr.status,
+      totalPaid: rr.totalPaid,
+      balance: rr.balance,
+    });
+  } catch (e) {
+    await conn.rollback();
+    console.error('[add payment error]', e);
+    return res.status(500).json({ error: 'Error agregando pago' });
+  } finally {
     conn.release();
   }
 });
@@ -240,13 +480,22 @@ router.get('/shift/:id', requireAuth(), async (req, res) => {
   const [[ticket]] = await pool.query('SELECT * FROM v_ticket_summary WHERE id=?', [id]);
   if (!ticket) return res.status(404).json({ error: 'Ticket no encontrado' });
 
-  const [payments] = await pool.query(
-    `SELECT id, ticketId, method, amount, createdAt, createdBy, note
-     FROM Payment
-     WHERE ticketId=?
-     ORDER BY createdAt ASC, id ASC`,
+  const [payments0] = await pool.query(
+    `SELECT
+        p.id, p.ticketId, p.method, p.amount, p.amountGiven, p.changeAmt, p.externalId,
+        p.createdAt, p.createdBy, p.note,
+        u.name AS userName
+     FROM Payment p
+     LEFT JOIN User u ON u.id = p.createdBy
+     WHERE p.ticketId=?
+     ORDER BY p.createdAt ASC, p.id ASC`,
     [id]
   );
+
+  const payments = (payments0 || []).map(p => ({
+    ...p,
+    method: normalizePaymentMethod(p.method) || p.method,
+  }));
 
   res.json({ ticket, payments });
 });

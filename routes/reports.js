@@ -37,10 +37,16 @@ router.get('/occupancy', requireAuth(), async (_req, res) => {
 router.get('/revenue', requireAuth(['ADMIN', 'SUPERVISOR']), async (req, res) => {
   const { fromStart, toEnd } = buildRange(req.query);
   const [rows] = await pool.query(
-    `SELECT method, SUM(amount) AS total
+    `SELECT
+        CASE
+          WHEN method='MP' THEN 'TRANSFER'
+          WHEN method='STRIPE' THEN 'CREDIT'
+          ELSE method
+        END AS method,
+        SUM(amount) AS total
        FROM Payment
       WHERE createdAt BETWEEN ? AND ?
-      GROUP BY method
+      GROUP BY 1
       ORDER BY total DESC`,
     [fromStart, toEnd]
   );
@@ -54,6 +60,15 @@ router.get('/revenue', requireAuth(['ADMIN', 'SUPERVISOR']), async (req, res) =>
 // 1) Resumen de pagos (total, cantidad, promedios)
 router.get('/payments/summary', requireAuth(['ADMIN', 'SUPERVISOR']), async (req, res) => {
   const { fromStart, toEnd, method } = buildRange(req.query);
+
+  // Filtro por método (compat: MP->TRANSFER, STRIPE->CREDIT)
+  let methodWhere = '1=1';
+  const methodArgs = [];
+  if (method !== 'ALL') {
+    if (method === 'TRANSFER') methodWhere = "p.method IN ('TRANSFER','MP')";
+    else if (method === 'CREDIT') methodWhere = "p.method IN ('CREDIT','STRIPE')";
+    else { methodWhere = 'p.method = ?'; methodArgs.push(method); }
+  }
 
   // Nota: count = tickets (distinct) para coincidir con el front.
   const [rows] = await pool.query(
@@ -69,9 +84,9 @@ router.get('/payments/summary', requireAuth(['ADMIN', 'SUPERVISOR']), async (req
     FROM Payment p
     JOIN Ticket  t ON t.id = p.ticketId
     WHERE p.createdAt BETWEEN ? AND ?
-      AND (? = 'ALL' OR p.method = ?)
+      AND ${methodWhere}
     `,
-    [fromStart, toEnd, method, method]
+    [fromStart, toEnd, ...methodArgs]
   );
 
   const r = rows[0] || { total: 0, tickets: 0, avgMinutes: 0, avgTicket: 0 };
@@ -88,12 +103,17 @@ router.get('/payments/by-method', requireAuth(['ADMIN', 'SUPERVISOR']), async (r
   const { fromStart, toEnd } = buildRange(req.query);
   const [rows] = await pool.query(
     `
-    SELECT p.method,
-           COUNT(*)               AS count,
-           COALESCE(SUM(p.amount), 0) AS total
+    SELECT
+      CASE
+        WHEN p.method='MP' THEN 'TRANSFER'
+        WHEN p.method='STRIPE' THEN 'CREDIT'
+        ELSE p.method
+      END AS method,
+      COUNT(*) AS count,
+      COALESCE(SUM(p.amount), 0) AS total
     FROM Payment p
     WHERE p.createdAt BETWEEN ? AND ?
-    GROUP BY p.method
+    GROUP BY 1
     ORDER BY total DESC
     `,
     [fromStart, toEnd]
@@ -110,6 +130,16 @@ router.get('/payments/by-method', requireAuth(['ADMIN', 'SUPERVISOR']), async (r
 // 3) Evolución diaria (total por día dentro del rango)
 router.get('/payments/daily', requireAuth(['ADMIN', 'SUPERVISOR']), async (req, res) => {
   const { fromStart, toEnd, method } = buildRange(req.query);
+
+  // Filtro por método (compat: MP->TRANSFER, STRIPE->CREDIT)
+  let methodWhere = '1=1';
+  const methodArgs = [];
+  if (method !== 'ALL') {
+    if (method === 'TRANSFER') methodWhere = "p.method IN ('TRANSFER','MP')";
+    else if (method === 'CREDIT') methodWhere = "p.method IN ('CREDIT','STRIPE')";
+    else { methodWhere = 'p.method = ?'; methodArgs.push(method); }
+  }
+
   const [rows] = await pool.query(
     `
     SELECT DATE(p.createdAt) AS date,
@@ -117,11 +147,11 @@ router.get('/payments/daily', requireAuth(['ADMIN', 'SUPERVISOR']), async (req, 
            COUNT(*) AS count
     FROM Payment p
     WHERE p.createdAt BETWEEN ? AND ?
-      AND (? = 'ALL' OR p.method = ?)
+      AND ${methodWhere}
     GROUP BY DATE(p.createdAt)
     ORDER BY DATE(p.createdAt)
     `,
-    [fromStart, toEnd, method, method]
+    [fromStart, toEnd, ...methodArgs]
   );
   const data = rows.map(r => ({
     date: r.date,                             // 'YYYY-MM-DD'

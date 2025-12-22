@@ -1,6 +1,7 @@
 const router = require('express').Router();
 const { pool } = require('../db');
 const { requireAuth } = require('../utils/requireAuth');
+const { isValidPaymentMethod } = require('../utils/paymentMethod');
 
 // Normaliza patentes (ABC123 / AB123CD)
 function normPlate(p){ return (p||'').trim().toUpperCase().replace(/\s+/g,''); }
@@ -118,15 +119,35 @@ router.get('/', requireAuth(['ADMIN','SUPERVISOR']), async (req, res) => {
 router.get('/lookup/by-plate', requireAuth(), async (req,res)=>{
   const plate = normPlate(req.query.plate);
   if(!plate) return res.status(400).json({error:'Patente requerida'});
+
+  // Traer el abonado + su última suscripción (determinístico)
   const [[s]] = await pool.query(
-    `SELECT s.*, sub.planName, sub.priceMonthly, sub.startDate, sub.nextDueDate, sub.status AS subStatus
-     FROM Subscriber s LEFT JOIN Subscription sub ON sub.subscriberId=s.id
-     WHERE s.plate=? AND s.status='ACTIVE'`, [plate]
+    `SELECT
+        s.*,
+        sub.planName,
+        sub.priceMonthly,
+        sub.startDate,
+        sub.nextDueDate,
+        sub.status AS subStatus
+     FROM Subscriber s
+     LEFT JOIN Subscription sub
+       ON sub.id = (
+         SELECT id
+           FROM Subscription
+          WHERE subscriberId = s.id
+          ORDER BY nextDueDate DESC, id DESC
+          LIMIT 1
+       )
+     WHERE s.plate=? AND s.status='ACTIVE'
+     LIMIT 1`,
+    [plate]
   );
+
   if (!s) return res.status(404).json({error:'No es abonado activo'});
-  // si está vencido marcamos subStatus
+
   const [[{ today }]] = await pool.query(`SELECT CURDATE() AS today`);
-  const pastDue = (s.nextDueDate && s.nextDueDate < today) ? true : false;
+  const pastDue = (!s.nextDueDate || s.subStatus !== 'ACTIVE' || s.nextDueDate < today) ? true : false;
+
   res.json({ abonado: s, pastDue });
 });
 
@@ -222,35 +243,14 @@ router.put('/:id', requireAuth(['ADMIN','SUPERVISOR']), async (req,res)=>{
   }finally{ conn.release(); }
 });
 
-router.post('/:id/charge', requireAuth(['ADMIN','SUPERVISOR']), async (req,res)=>{
-  const id = Number(req.params.id);
-  const conn = await pool.getConnection();
-  try{
-    await conn.beginTransaction();
-
-    const [[s]] = await conn.query(
-      `SELECT sub.id AS subscriptionId, sub.priceMonthly, sub.startDate, sub.nextDueDate
-       FROM Subscription sub WHERE sub.subscriberId=?`, [id]);
-    if(!s){ await conn.rollback(); return res.status(400).json({error:'Sin suscripción'}); }
-
-    // period: desde nextDueDate anterior hasta +1 mes
-    const [[{ periodEnd }]] = await conn.query(`SELECT DATE_ADD(?, INTERVAL 1 MONTH) AS periodEnd`, [s.nextDueDate]);
-
-    const [inv] = await conn.query(
-      `INSERT INTO SubscriptionInvoice(subscriptionId, periodStart, periodEnd, amount, paidAt, status)
-       VALUES (?,?,?,?,NOW(),'PAID')`,
-      [s.subscriptionId, s.nextDueDate, periodEnd, Number(s.priceMonthly||0)]
-    );
-
-    await conn.query(`UPDATE Subscription SET nextDueDate=? , status='ACTIVE' WHERE id=?`, [periodEnd, s.subscriptionId]);
-
-    await conn.commit();
-    res.json({ ok:true, invoiceId: inv.insertId, nextDueDate: periodEnd });
-  }catch(e){
-    await conn.rollback();
-    console.error('[subscribers.charge]', e);
-    res.status(500).json({error:'No se pudo registrar el pago'});
-  }finally{ conn.release(); }
+// (Deprecated) Previously created SubscriptionInvoice rows.
+// We are standardizing on Payment rows only.
+router.post('/:id/charge', requireAuth(['ADMIN','SUPERVISOR']), async (_req,res)=>{
+  return res.status(410).json({
+    ok:false,
+    error:'DEPRECATED',
+    message:'Endpoint deprecated. Use POST /subscribers/:id/pay (records Payment + advances nextDueDate).'
+  });
 });
 
 // PATCH /subscribers/:id
@@ -331,12 +331,13 @@ router.delete('/:id', requireAuth(['ADMIN','SUPERVISOR']), async (req,res)=>{
 // POST /subscribers/:id/pay
 // Avanza el nextDueDate de la ÚLTIMA suscripción del abonado.
 // Body opcional: { months?: number }  (default 1)
-router.post('/:id/pay', requireAuth(['ADMIN','SUPERVISOR']), async (req, res) => {
+// Nota: este endpoint se usa desde caja/operación, por eso lo permitimos a cualquier usuario autenticado.
+router.post('/:id/pay', requireAuth(), async (req, res) => {
   const id = Number(req.params.id);
   const months = Math.max(1, Number(req.body?.months) || 1);
   const method = String(req.body?.method || 'CASH').toUpperCase();
-  const METHOD_OK = ['CASH','DEBIT','CREDIT','MP','SUBSCRIPTION']; // SUBSCRIPTION si querés marcarlo así
-  if (!METHOD_OK.includes(method)) {
+  const METHOD_OK = ['CASH','DEBIT','CREDIT','TRANSFER'];
+  if (!METHOD_OK.includes(method) || !isValidPaymentMethod(method)) {
     return res.status(400).json({ ok:false, error:'INVALID_METHOD' });
   }
   const userId = req.user?.id || null;
@@ -380,23 +381,11 @@ router.post('/:id/pay', requireAuth(['ADMIN','SUPERVISOR']), async (req, res) =>
     const [[{ fromDate }]] = await conn.query(`SELECT DATE(?) AS fromDate`, [base]);
     const note = `Suscripción ${months} mes(es). Período desde ${fromDate} hasta ${newDue}.`;
 
-    // Insert Payment (ticketId NULL, con subscriberId si existe la columna)
-    // Detectamos si la tabla tiene subscriberId (por si no aplicaste la migración aún)
-    let hasSubscriberId = true;
-    try {
-      await conn.query(`SELECT subscriberId FROM Payment LIMIT 1`);
-    } catch {
-      hasSubscriberId = false;
-    }
-
-    const cols = ['ticketId','method','amount','createdBy','note'];
-    const vals = [null, method, amount, userId, note];
-
-    if (hasSubscriberId) { cols.splice(1, 0, 'subscriberId'); vals.splice(1, 0, id); }
-
+    // Insert Payment (ticketId NULL, subscriberId presente en el schema actual)
     const [p] = await conn.query(
-      `INSERT INTO Payment (${cols.join(',')}) VALUES (${cols.map(()=>'?').join(',')})`,
-      vals
+      `INSERT INTO Payment (ticketId, subscriberId, method, amount, createdBy, note)
+       VALUES (?,?,?,?,?,?)`,
+      [null, id, method, amount, userId, note]
     );
 
     await conn.commit();
