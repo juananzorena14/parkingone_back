@@ -84,32 +84,20 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
-function safeMount(prefix, modulePath) {
-  try {
-    // eslint-disable-next-line global-require, import/no-dynamic-require
-    const r = require(modulePath);
-    app.use(prefix, r);
-  } catch (e) {
-    console.error(`[boot] Failed to mount ${modulePath} on ${prefix}:`, e);
-    app.use(prefix, (_req, res) => {
-      res.status(500).json({ ok: false, error: `Boot error mounting ${modulePath}` });
-    });
-  }
-}
-
 // Rutas bajo /api
-safeMount('/api/auth', './routes/auth');
-safeMount('/api/settings', './routes/settings');
-safeMount('/api/rateplans', './routes/rateplans');
-safeMount('/api/tickets', './routes/tickets');
-safeMount('/api/payments', './routes/payments');
-safeMount('/api/reports', './routes/reports');
-safeMount('/api/subscribers', './routes/subscribers');
-safeMount('/api/cash-shifts', './routes/cashShift');
+// Importante para Vercel: usar require() estático (string literal) para que el bundler incluya los archivos.
+try { app.use('/api/auth', require('./routes/auth')); } catch (e) { console.error('[boot] Failed to mount ./routes/auth', e); }
+try { app.use('/api/settings', require('./routes/settings')); } catch (e) { console.error('[boot] Failed to mount ./routes/settings', e); }
+try { app.use('/api/rateplans', require('./routes/rateplans')); } catch (e) { console.error('[boot] Failed to mount ./routes/rateplans', e); }
+try { app.use('/api/tickets', require('./routes/tickets')); } catch (e) { console.error('[boot] Failed to mount ./routes/tickets', e); }
+try { app.use('/api/payments', require('./routes/payments')); } catch (e) { console.error('[boot] Failed to mount ./routes/payments', e); }
+try { app.use('/api/reports', require('./routes/reports')); } catch (e) { console.error('[boot] Failed to mount ./routes/reports', e); }
+try { app.use('/api/subscribers', require('./routes/subscribers')); } catch (e) { console.error('[boot] Failed to mount ./routes/subscribers', e); }
+try { app.use('/api/cash-shifts', require('./routes/cashShift')); } catch (e) { console.error('[boot] Failed to mount ./routes/cashShift', e); }
 
 // Static público
 app.use('/public', express.static('public'));
-safeMount('/public', './routes/public');
+try { app.use('/public', require('./routes/public')); } catch (e) { console.error('[boot] Failed to mount ./routes/public', e); }
 
 // Global error handler (loggea en Runtime Logs)
 app.use((err, _req, res, _next) => {
