@@ -27,6 +27,7 @@ async function load() {
     const rules = [];
     if (data.rateplan.base       != null) rules.push(`Base: ${fmtARS.format(Number(data.rateplan.base||0))}`);
     if (data.rateplan.perHour    != null) rules.push(`Por hora: ${fmtARS.format(Number(data.rateplan.perHour||0))}`);
+    if (data.rateplan.per30min   != null) rules.push(`Cada 30': ${fmtARS.format(Number(data.rateplan.per30min||0))}`);
     if (data.rateplan.per15min   != null) rules.push(`Cada 15': ${fmtARS.format(Number(data.rateplan.per15min||0))}`);
     if (data.rateplan.toleranceMin)       rules.push(`Tolerancia: ${data.rateplan.toleranceMin} min`);
     if (data.rateplan.nightFlat) {
