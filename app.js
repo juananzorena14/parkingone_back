@@ -75,6 +75,9 @@ app.use(express.json());
 app.use(morgan('dev'));
 app.use(helmet());
 
+// Avoid noisy 404s in browser console
+app.get('/favicon.ico', (_req, res) => res.status(204).end());
+
 // Health (para chequear rápido si la Function levanta)
 app.get('/api/health', (_req, res) => {
   res.json({
