@@ -5,9 +5,7 @@
   ],
   "functions": {
     "api/index.js": {
-      "includeFiles": [
-        "public/**"
-      ]
+      "includeFiles": "public/**"
     }
   },
   "routes": [
