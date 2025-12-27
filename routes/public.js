@@ -12,7 +12,7 @@ router.get('/tickets/:code/summary', async (req, res) => {
   const [[row]] = await pool.query(
     `SELECT 
         t.id, t.plate, t.vehicleType, t.checkInAt, t.status, t.entryCode,
-        rp.id AS ratePlanId, rp.name AS rateName, rp.base, rp.perHour, rp.per30min, rp.per15min,
+        rp.id AS ratePlanId, rp.name AS rateName, rp.perHour, rp.per30min,
         rp.toleranceMin, rp.nightFlat, rp.nightStartsAt, rp.nightEndsAt, rp.currency
      FROM Ticket t
      JOIN RatePlan rp ON rp.id = t.ratePlanId
@@ -58,10 +58,8 @@ router.get('/tickets/:code/summary', async (req, res) => {
     rateplan: {
       id: row.ratePlanId,
       name: row.rateName,
-      base: Number(row.base || 0),
       perHour: row.perHour != null ? Number(row.perHour) : null,
       per30min: row.per30min != null ? Number(row.per30min) : null,
-      per15min: row.per15min != null ? Number(row.per15min) : null,
       toleranceMin: row.toleranceMin != null ? Number(row.toleranceMin) : 0,
       nightFlat: row.nightFlat != null ? Number(row.nightFlat) : null,
       nightStartsAt: row.nightStartsAt != null ? Number(row.nightStartsAt) : null,
