@@ -70,30 +70,61 @@ router.get('/payments/summary', requireAuth(['ADMIN', 'SUPERVISOR']), async (req
     else { methodWhere = 'p.method = ?'; methodArgs.push(method); }
   }
 
-  // Nota: count = tickets (distinct) para coincidir con el front.
+  // Totales deben ser netos (incluye reversos), pero los conteos no deben inflarse.
+  // - total: SUM(amount) incluyendo reversos
+  // - tickets: DISTINCT ticketId solo de pagos NO reverso
+  // - avgMinutes: promedio de Ticket.minutes para tickets con al menos 1 pago NO reverso
   const [rows] = await pool.query(
     `
     SELECT
-      COALESCE(SUM(p.amount), 0)                         AS total,
-      COUNT(DISTINCT p.ticketId)                         AS tickets,
-      COALESCE(AVG(t.minutes), 0)                        AS avgMinutes,
-      CASE WHEN COUNT(DISTINCT p.ticketId) = 0
-           THEN 0
-           ELSE COALESCE(SUM(p.amount) / COUNT(DISTINCT p.ticketId), 0)
-      END                                                AS avgTicket
-    FROM Payment p
-    JOIN Ticket  t ON t.id = p.ticketId
-    WHERE p.createdAt BETWEEN ? AND ?
-      AND ${methodWhere}
+      -- Total neto (incluye reversos)
+      (
+        SELECT COALESCE(SUM(p.amount),0)
+          FROM Payment p
+         WHERE p.ticketId IS NOT NULL
+           AND p.createdAt BETWEEN ? AND ?
+           AND ${methodWhere}
+      ) AS total,
+
+      -- Tickets (sin inflar por reversos)
+      (
+        SELECT COUNT(DISTINCT p.ticketId)
+          FROM Payment p
+         WHERE p.ticketId IS NOT NULL
+           AND p.reversesPaymentId IS NULL
+           AND p.createdAt BETWEEN ? AND ?
+           AND ${methodWhere}
+      ) AS tickets,
+
+      -- Promedio de minutos por ticket (solo tickets con pago no reverso)
+      (
+        SELECT COALESCE(AVG(t.minutes),0)
+          FROM Ticket t
+          JOIN (
+            SELECT DISTINCT p.ticketId
+              FROM Payment p
+             WHERE p.ticketId IS NOT NULL
+               AND p.reversesPaymentId IS NULL
+               AND p.createdAt BETWEEN ? AND ?
+               AND ${methodWhere}
+          ) x ON x.ticketId = t.id
+      ) AS avgMinutes
     `,
-    [fromStart, toEnd, ...methodArgs]
+    [
+      fromStart, toEnd, ...methodArgs,
+      fromStart, toEnd, ...methodArgs,
+      fromStart, toEnd, ...methodArgs,
+    ]
   );
 
-  const r = rows[0] || { total: 0, tickets: 0, avgMinutes: 0, avgTicket: 0 };
+  const r = rows[0] || { total: 0, tickets: 0, avgMinutes: 0 };
+  const total = Number(r.total || 0);
+  const count = Number(r.tickets || 0);
+
   res.json({
-    total: Number(r.total || 0),
-    count: Number(r.tickets || 0),         // <- el front espera "count" (tickets cerrados)
-    avgTicket: Number(r.avgTicket || 0),
+    total,
+    count,
+    avgTicket: count ? (total / count) : 0,
     avgMinutes: Number(r.avgMinutes || 0),
   });
 });
@@ -109,7 +140,7 @@ router.get('/payments/by-method', requireAuth(['ADMIN', 'SUPERVISOR']), async (r
         WHEN p.method='STRIPE' THEN 'CREDIT'
         ELSE p.method
       END AS method,
-      COUNT(*) AS count,
+      COUNT(CASE WHEN p.reversesPaymentId IS NULL THEN 1 END) AS count,
       COALESCE(SUM(p.amount), 0) AS total
     FROM Payment p
     WHERE p.createdAt BETWEEN ? AND ?
@@ -144,7 +175,7 @@ router.get('/payments/daily', requireAuth(['ADMIN', 'SUPERVISOR']), async (req, 
     `
     SELECT DATE(p.createdAt) AS date,
            COALESCE(SUM(p.amount), 0) AS total,
-           COUNT(*) AS count
+           COUNT(CASE WHEN p.reversesPaymentId IS NULL THEN 1 END) AS count
     FROM Payment p
     WHERE p.createdAt BETWEEN ? AND ?
       AND ${methodWhere}

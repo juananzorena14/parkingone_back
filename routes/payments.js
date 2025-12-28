@@ -5,6 +5,7 @@ const { isValidPaymentMethod, normalizePaymentMethod, methodToBox } = require('.
 
 const METHOD_OK = ['CASH', 'DEBIT', 'CREDIT', 'TRANSFER'];
 
+const REVERSE_WINDOW_MIN = 5;
 
 function validatePaymentInput(input) {
   const method = String(input?.method || '').toUpperCase();
@@ -129,12 +130,16 @@ router.get('/', requireAuth(['ADMIN','SUPERVISOR']), async (req, res) => {
   // SELECT
   const sql = `
     SELECT
-      p.id, p.createdAt, p.method, p.amount, p.amountGiven, p.changeAmt, p.note,
+      p.id, p.createdAt, p.method, p.amount, p.amountGiven, p.changeAmt, p.externalId, p.note,
       p.ticketId, t.plate AS ticketPlate,
       p.subscriberId, s.fullName AS subscriberName, s.plate AS subscriberPlate,
       p.createdBy,
-      u.name AS userName
+      u.name AS userName,
+      p.reversesPaymentId,
+      p.reverseReason,
+      rev.id AS reversalId
     FROM Payment p
+    LEFT JOIN Payment    rev ON rev.reversesPaymentId = p.id
     LEFT JOIN Ticket     t ON t.id = p.ticketId
     LEFT JOIN Subscriber s ON s.id = p.subscriberId
     LEFT JOIN User       u ON u.id = p.createdBy
@@ -154,6 +159,11 @@ router.get('/', requireAuth(['ADMIN','SUPERVISOR']), async (req, res) => {
           : (r.subscriberId
               ? `${r.subscriberName || ''} (${r.subscriberPlate || ''})`.trim()
               : (r.note || '-')),
+    isReversal: r.reversesPaymentId != null,
+    isReversed: r.reversalId != null,
+    reversalId: r.reversalId ?? null,
+    reversesPaymentId: r.reversesPaymentId ?? null,
+    reverseReason: r.reverseReason ?? null,
   }));
 
   res.json({ ok: true, data, total, page, size });
@@ -204,12 +214,16 @@ router.get('/export', requireAuth(['ADMIN','SUPERVISOR']), async (req, res) => {
 
     const sql = `
       SELECT
-        p.id, p.createdAt, p.method, p.amount, p.amountGiven, p.changeAmt, p.note,
+        p.id, p.createdAt, p.method, p.amount, p.amountGiven, p.changeAmt, p.externalId, p.note,
         p.ticketId, t.plate AS ticketPlate,
         p.subscriberId, s.fullName AS subscriberName, s.plate AS subscriberPlate,
         p.createdBy,
-        u.name AS userName
+        u.name AS userName,
+        p.reversesPaymentId,
+        p.reverseReason,
+        rev.id AS reversalId
       FROM Payment p
+      LEFT JOIN Payment    rev ON rev.reversesPaymentId = p.id
       LEFT JOIN Ticket     t ON t.id = p.ticketId
       LEFT JOIN Subscriber s ON s.id = p.subscriberId
       LEFT JOIN User       u ON u.id = p.createdBy
@@ -227,7 +241,8 @@ router.get('/export', requireAuth(['ADMIN','SUPERVISOR']), async (req, res) => {
     // - sep=; so Excel picks semicolon separator correctly
     const headers = [
       'ID','Fecha','Kind','Caja','Método','Monto','EfectivoNeto','Recibido','Vuelto',
-      'TicketId','Patente','SubscriberId','Suscriptor','PatenteSub','UsuarioId','Usuario','Nota'
+      'EsReverso','ReversaPagoId','Reversado','ReversalId','MotivoReverso',
+      'TicketId','Patente','SubscriberId','Suscriptor','PatenteSub','UsuarioId','Usuario','ExternalId','Nota'
     ];
 
     const lines = ['sep=;'.trim(), headers.join(';')];
@@ -244,6 +259,9 @@ router.get('/export', requireAuth(['ADMIN','SUPERVISOR']), async (req, res) => {
         ? (Number.isFinite(amountGiven) ? amountGiven : amount) - (Number.isFinite(changeAmt) ? changeAmt : 0)
         : '';
 
+      const isReversal = r.reversesPaymentId != null;
+      const isReversed = r.reversalId != null;
+
       lines.push([
         csvEscape(r.id),
         csvEscape(r.createdAt?.toISOString?.() ? r.createdAt.toISOString() : r.createdAt),
@@ -254,6 +272,11 @@ router.get('/export', requireAuth(['ADMIN','SUPERVISOR']), async (req, res) => {
         csvEscape(cashNet),
         csvEscape(amountGiven ?? ''),
         csvEscape(changeAmt ?? ''),
+        csvEscape(isReversal ? 1 : 0),
+        csvEscape(r.reversesPaymentId ?? ''),
+        csvEscape(isReversed ? 1 : 0),
+        csvEscape(r.reversalId ?? ''),
+        csvEscape(r.reverseReason ?? ''),
         csvEscape(r.ticketId ?? ''),
         csvEscape(r.ticketPlate ?? ''),
         csvEscape(r.subscriberId ?? ''),
@@ -261,6 +284,7 @@ router.get('/export', requireAuth(['ADMIN','SUPERVISOR']), async (req, res) => {
         csvEscape(r.subscriberPlate ?? ''),
         csvEscape(r.createdBy ?? ''),
         csvEscape(r.userName ?? ''),
+        csvEscape(r.externalId ?? ''),
         csvEscape(r.note ?? ''),
       ].join(';'));
     }
@@ -287,8 +311,11 @@ router.get('/by-ticket/:ticketId', requireAuth(), async (req, res) => {
     `SELECT
         p.id, p.ticketId, p.method, p.amount, p.amountGiven, p.changeAmt, p.externalId,
         p.createdAt, p.createdBy, p.note,
+        p.reversesPaymentId, p.reverseReason,
+        rev.id AS reversalId,
         u.name AS userName
        FROM Payment p
+       LEFT JOIN Payment rev ON rev.reversesPaymentId = p.id
        LEFT JOIN User u ON u.id = p.createdBy
       WHERE p.ticketId = ?
       ORDER BY p.createdAt ASC, p.id ASC`,
@@ -298,16 +325,135 @@ router.get('/by-ticket/:ticketId', requireAuth(), async (req, res) => {
   const rows = (rows0 || []).map(r => ({
     ...r,
     method: normalizePaymentMethod(r.method) || r.method,
+    isReversal: r.reversesPaymentId != null,
+    isReversed: r.reversalId != null,
+    reversalId: r.reversalId ?? null,
+    reversesPaymentId: r.reversesPaymentId ?? null,
+    reverseReason: r.reverseReason ?? null,
   }));
 
   res.json(rows);
 });
 
-// Edit a payment (used to fix operator mistakes)
-router.put('/:id', requireAuth(), async (req, res) => {
+// Reverse a payment (auditable: creates a new negative row linked to the original)
+router.post('/:id/reverse', requireAuth(), async (req, res) => {
   const id = Number(req.params.id);
   const userId = req.user?.id || null;
-  const role = req.user?.role || null;
+  const role = String(req.user?.role || '').toUpperCase();
+  const reason = String(req.body?.reason || '').trim();
+
+  if (!id) return res.status(400).json({ error: 'ID inválido' });
+  if (!reason) return res.status(400).json({ error: 'Motivo requerido' });
+
+  const isPrivileged = role === 'ADMIN' || role === 'SUPERVISOR';
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [[p0]] = await conn.query('SELECT * FROM Payment WHERE id=? FOR UPDATE', [id]);
+    if (!p0) { await conn.rollback(); return res.status(404).json({ error: 'Pago no encontrado' }); }
+
+    // No permitir reversar un reverso
+    if (p0.reversesPaymentId != null) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'Este pago ya es un reverso.' });
+    }
+
+    // Evitar doble reverso
+    const [[rev0]] = await conn.query('SELECT id FROM Payment WHERE reversesPaymentId=? LIMIT 1 FOR UPDATE', [id]);
+    if (rev0) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'Este pago ya fue reversado.' });
+    }
+
+    if (!isPrivileged) {
+      // Operario: sólo si lo creó él
+      if (p0.createdBy == null || Number(p0.createdBy) !== Number(userId)) {
+        await conn.rollback();
+        return res.status(403).json({ error: 'No podés reversar pagos de otro usuario.' });
+      }
+
+      // Debe existir turno abierto y el pago debe pertenecer a ese turno
+      const [[shift]] = await conn.query(
+        'SELECT id, openedAt FROM CashShift WHERE userId=? AND closedAt IS NULL ORDER BY openedAt DESC LIMIT 1',
+        [userId]
+      );
+      if (!shift) {
+        await conn.rollback();
+        return res.status(403).json({ error: 'No tenés turno abierto.' });
+      }
+
+      const payAt = new Date(p0.createdAt).getTime();
+      const shiftAt = new Date(shift.openedAt).getTime();
+      if (!Number.isFinite(payAt) || payAt < shiftAt) {
+        await conn.rollback();
+        return res.status(403).json({ error: 'El pago no pertenece al turno actual.' });
+      }
+
+      // Ventana corta
+      const ageMin = (Date.now() - payAt) / 60000;
+      if (!Number.isFinite(ageMin) || ageMin > REVERSE_WINDOW_MIN) {
+        await conn.rollback();
+        return res.status(403).json({ error: `Solo podés reversar dentro de los ${REVERSE_WINDOW_MIN} minutos.` });
+      }
+    }
+
+    const method = normalizePaymentMethod(p0.method) || String(p0.method || '').toUpperCase();
+    if (!METHOD_OK.includes(method) || !isValidPaymentMethod(method)) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'Método de pago inválido' });
+    }
+
+    const originalAmount = Number(p0.amount);
+    if (!Number.isFinite(originalAmount) || originalAmount <= 0) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'No se puede reversar este pago.' });
+    }
+
+    const note = `REVERSO de pago #${p0.id}: ${reason}`;
+
+    const [r] = await conn.query(
+      `INSERT INTO Payment (
+        ticketId, subscriberId,
+        reversesPaymentId, reverseReason,
+        method, amount,
+        amountGiven, changeAmt,
+        createdBy, externalId, note
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        p0.ticketId ?? null,
+        p0.subscriberId ?? null,
+        p0.id,
+        reason,
+        method,
+        -originalAmount,
+        null,
+        null,
+        userId,
+        p0.externalId ?? null,
+        note,
+      ]
+    );
+
+    await conn.commit();
+
+    const [[orig]] = await pool.query('SELECT * FROM Payment WHERE id=?', [p0.id]);
+    const [[rev]] = await pool.query('SELECT * FROM Payment WHERE id=?', [r.insertId]);
+
+    return res.json({ ok: true, original: orig, reversal: rev });
+  } catch (e) {
+    await conn.rollback();
+    console.error('[payments.reverse]', e);
+    return res.status(500).json({ error: 'DB_ERROR' });
+  } finally {
+    conn.release();
+  }
+});
+
+// Edit a payment (admin/supervisor: metadata only)
+router.put('/:id', requireAuth(['ADMIN','SUPERVISOR']), async (req, res) => {
+  const id = Number(req.params.id);
 
   if (!id) return res.status(400).json({ error: 'ID inválido' });
 
@@ -318,28 +464,44 @@ router.put('/:id', requireAuth(), async (req, res) => {
     const [[p0]] = await conn.query('SELECT * FROM Payment WHERE id=? FOR UPDATE', [id]);
     if (!p0) { await conn.rollback(); return res.status(404).json({ error: 'Pago no encontrado' }); }
 
-    const canEdit = role === 'ADMIN' || role === 'SUPERVISOR' || (p0.createdBy != null && Number(p0.createdBy) === Number(userId));
-    if (!canEdit) { await conn.rollback(); return res.status(403).json({ error: 'Forbidden' }); }
-
-    let p;
-    try {
-      p = validatePaymentInput(req.body);
-    } catch (e) {
+    // No editar reversos
+    if (p0.reversesPaymentId != null) {
       await conn.rollback();
-      return res.status(400).json({ error: String(e.message || e) });
+      return res.status(400).json({ error: 'No se puede editar un reverso.' });
+    }
+
+    // No permitir cambiar el monto via edit. (Para corregir monto: reverso + nuevo pago.)
+    if (req.body?.amount != null && Number(req.body.amount) !== Number(p0.amount)) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'Para corregir el monto: reversar y registrar el pago correcto.' });
+    }
+
+    const method = String(req.body?.method || p0.method || '').toUpperCase();
+    if (!METHOD_OK.includes(method) || !isValidPaymentMethod(method)) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'Método de pago inválido' });
+    }
+
+    const externalId = req.body?.externalId === '' ? null : (req.body?.externalId ?? p0.externalId ?? null);
+    const note = req.body?.note === '' ? null : (req.body?.note ?? p0.note ?? null);
+
+    // Si el método pasa a CASH, aseguramos campos consistentes
+    let amountGiven = p0.amountGiven;
+    let changeAmt = p0.changeAmt;
+    if (method !== 'CASH') {
+      amountGiven = null;
+      changeAmt = null;
+    } else {
+      if (amountGiven == null) amountGiven = Number(p0.amount);
+      if (changeAmt == null) changeAmt = 0;
     }
 
     await conn.query(
       `UPDATE Payment
-          SET method=?, amount=?, amountGiven=?, changeAmt=?, externalId=?, note=?
+          SET method=?, amountGiven=?, changeAmt=?, externalId=?, note=?
         WHERE id=?`,
-      [p.method, p.amount, p.amountGiven, p.changeAmt, p.externalId, p.note, id]
+      [method, amountGiven, changeAmt, externalId, note, id]
     );
-
-    let ticket = null;
-    if (p0.ticketId) {
-      ticket = await reconcileTicket(conn, Number(p0.ticketId), userId);
-    }
 
     await conn.commit();
 
@@ -353,7 +515,7 @@ router.put('/:id', requireAuth(), async (req, res) => {
 
     const row = row0 ? { ...row0, method: normalizePaymentMethod(row0.method) || row0.method } : row0;
 
-    return res.json({ ok: true, payment: row, ticket });
+    return res.json({ ok: true, payment: row });
   } catch (e) {
     await conn.rollback();
     console.error('[payments.update]', e);
@@ -363,40 +525,9 @@ router.put('/:id', requireAuth(), async (req, res) => {
   }
 });
 
-// Delete a payment
-router.delete('/:id', requireAuth(), async (req, res) => {
-  const id = Number(req.params.id);
-  const userId = req.user?.id || null;
-  const role = req.user?.role || null;
-
-  if (!id) return res.status(400).json({ error: 'ID inválido' });
-
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-
-    const [[p0]] = await conn.query('SELECT * FROM Payment WHERE id=? FOR UPDATE', [id]);
-    if (!p0) { await conn.rollback(); return res.status(404).json({ error: 'Pago no encontrado' }); }
-
-    const canEdit = role === 'ADMIN' || role === 'SUPERVISOR' || (p0.createdBy != null && Number(p0.createdBy) === Number(userId));
-    if (!canEdit) { await conn.rollback(); return res.status(403).json({ error: 'Forbidden' }); }
-
-    await conn.query('DELETE FROM Payment WHERE id=?', [id]);
-
-    let ticket = null;
-    if (p0.ticketId) {
-      ticket = await reconcileTicket(conn, Number(p0.ticketId), userId);
-    }
-
-    await conn.commit();
-    return res.json({ ok: true, deletedId: id, ticket });
-  } catch (e) {
-    await conn.rollback();
-    console.error('[payments.delete]', e);
-    return res.status(500).json({ error: 'DB_ERROR' });
-  } finally {
-    conn.release();
-  }
+// Delete disabled: keep audit trail (use reverse instead)
+router.delete('/:id', requireAuth(['ADMIN','SUPERVISOR']), async (_req, res) => {
+  return res.status(405).json({ error: 'No se permite eliminar pagos. Usá reversar.' });
 });
 
 module.exports = router;
