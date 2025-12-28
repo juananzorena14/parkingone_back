@@ -13,7 +13,7 @@
       <div class="card-header">
         <div>
           <div id="parkingName" class="title">Estacionamiento</div>
-          <div class="subtitle">Comprobante de Ingreso (vista pública)</div>
+          <div id="parkingMeta" class="subtitle">Comprobante de Ingreso (vista pública)</div>
         </div>
         <div class="right">
           <code id="entryCode" class="code"></code>
@@ -57,16 +57,22 @@
         <div class="box">
           <div class="label mb">Acciones</div>
           <div class="actions">
-            <button id="btnCopy"  class="btn">Copiar código</button>
-            <a id="btnShare" class="btn" href="#" target="_blank" rel="noopener">Compartir</a>
-            <a id="btnWhats" class="btn" href="#" target="_blank" rel="noopener">WhatsApp</a>
-            <button id="btnPrint" class="btn primary">Imprimir</button>
+            <a id="btnWhats" class="btn primary" href="#" target="_blank" rel="noopener">Enviar por WhatsApp</a>
+            <a id="btnShare" class="btn" href="#" target="_blank" rel="noopener">Compartir link</a>
           </div>
         </div>
       </div>
 
       <div id="note" class="muted small mt">
-        Conserve este comprobante. El cálculo puede incluir base, bloques (hora/15’), tolerancia y tarifa nocturna.
+        Indicaciones: conserve este comprobante y presente el código/QR en caja al salir. El monto final se confirma en caja.
+      </div>
+
+      <div class="panel mt">
+        <div class="panel-title">Mostrar este QR en caja</div>
+        <div class="muted">El operador puede escanearlo para identificar tu ticket.</div>
+        <div style="display:flex;justify-content:center;margin-top:10px;">
+          <img id="qrImg" alt="QR" style="width:220px;max-width:100%;height:auto" />
+        </div>
       </div>
     </div>
   </div>

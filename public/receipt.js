@@ -13,6 +13,11 @@ async function load() {
     const data = await res.json();
 
     $('parkingName').textContent = data.parking?.name || 'Estacionamiento';
+
+    const metaParts = [];
+    if (data.parking?.direction) metaParts.push(String(data.parking.direction));
+    if (data.parking?.phone) metaParts.push(`Tel: ${data.parking.phone}`);
+    $('parkingMeta').textContent = metaParts.length ? metaParts.join(' · ') : 'Comprobante de Ingreso (vista pública)';
     $('entryCode').textContent   = data.ticket.entryCode || code;
     $('plate').textContent       = data.ticket.plate;
     $('vehicleType').textContent = data.ticket.vehicleType;
@@ -45,8 +50,11 @@ async function load() {
     const pageUrl = location.href;
     $('btnShare').href = `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(pageUrl)}`;
     $('btnWhats').href = `https://wa.me/?text=${shareText}%0A${encodeURIComponent(pageUrl)}`;
-    $('btnCopy').onclick  = () => navigator.clipboard.writeText(data.ticket.entryCode);
-    $('btnPrint').onclick = () => window.print();
+
+    const qrImg = $('qrImg');
+    if (qrImg) {
+      qrImg.src = `${API_BASE}/tickets/${encodeURIComponent(code)}/qr?ts=${Date.now()}`;
+    }
 
   } catch (e) {
     alert(e.message || e);

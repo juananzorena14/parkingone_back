@@ -427,7 +427,22 @@ router.post('/:id/payments', requireAuth(), async (req, res) => {
   }
 });
 
-router.get("/verify/:code", async (req,res) => {
+// Lookup rápido por código (para caja / scan de QR)
+router.get('/by-code/:code', requireAuth(), async (req, res) => {
+  const code = String(req.params.code || '').trim();
+  if (!code) return res.status(400).json({ error: 'Código inválido' });
+
+  const [[t]] = await pool.query('SELECT * FROM Ticket WHERE entryCode=? LIMIT 1', [code]);
+  if (!t) return res.status(404).json({ error: 'Ticket no encontrado' });
+
+  // Si querés permitir ver CLOSED para auditoría, sacá este guard.
+  if (t.status === 'CLOSED') return res.status(400).json({ error: 'Ticket ya cerrado' });
+
+  return res.json({ ok: true, ticket: t });
+});
+
+// Back-compat (si lo estabas usando en algún lado). Ahora requiere auth.
+router.get("/verify/:code", requireAuth(), async (req,res) => {
   const code = req.params.code;
   const [[t]] = await pool.query(
     `SELECT t.id, t.plate, t.vehicleType, t.checkInAt, t.status,

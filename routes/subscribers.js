@@ -143,12 +143,14 @@ router.get('/lookup/by-plate', requireAuth(), async (req,res)=>{
     [plate]
   );
 
-  if (!s) return res.status(404).json({error:'No es abonado activo'});
+  if (!s) {
+    return res.json({ ok: true, found: false });
+  }
 
   const [[{ today }]] = await pool.query(`SELECT CURDATE() AS today`);
   const pastDue = (!s.nextDueDate || s.subStatus !== 'ACTIVE' || s.nextDueDate < today) ? true : false;
 
-  res.json({ abonado: s, pastDue });
+  res.json({ ok: true, found: true, abonado: s, pastDue });
 });
 
 // GET by id

@@ -2,6 +2,28 @@ const router = require('express').Router();
 const { pool } = require('../db');
 const { calcAmount } = require('../utils/calcAmount'); // tu misma función de backend
 const dayjs = require('dayjs');
+const QRCode = require('qrcode');
+
+// GET /public/tickets/:code/qr
+// Devuelve PNG QR del código (para que el operador lo escanee)
+router.get('/tickets/:code/qr', async (req, res) => {
+  const code = String(req.params.code || '').trim();
+  if (!code) return res.status(400).send('BAD_CODE');
+
+  try {
+    // Optionally validate ticket exists (avoid generating random codes)
+    const [[t]] = await pool.query('SELECT id FROM Ticket WHERE entryCode=? LIMIT 1', [code]);
+    if (!t) return res.status(404).send('NOT_FOUND');
+
+    const png = await QRCode.toBuffer(code, { type: 'png', margin: 1, width: 320, errorCorrectionLevel: 'M' });
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'no-store');
+    return res.send(png);
+  } catch (e) {
+    console.error('[public qr]', e);
+    return res.status(500).send('QR_ERROR');
+  }
+});
 
 // GET /public/tickets/:code/summary
 // Devuelve ticket + rateplan + settings + cálculo en vivo (amount/minutes)
@@ -24,14 +46,18 @@ router.get('/tickets/:code/summary', async (req, res) => {
 
   let parkingName = 'Estacionamiento';
   let tz = null;
+  let phone = null;
+  let direction = null;
   try {
     // DB schema uses Settings.parking_name
     const [[cfg]] = await pool.query(
-      `SELECT parking_name AS name, timezone FROM Settings WHERE id=1`
+      `SELECT parking_name AS name, timezone, phone, direction FROM Settings WHERE id=1`
     );
     if (cfg) {
       parkingName = cfg.name || parkingName;
       tz = cfg.timezone || tz;
+      phone = cfg.phone || null;
+      direction = cfg.direction || null;
     }
   } catch (_) {
     // Si las columnas no existen, ignoramos silenciosamente
@@ -46,7 +72,7 @@ router.get('/tickets/:code/summary', async (req, res) => {
 
   res.json({
     ok: true,
-    parking: { name: parkingName, timezone: tz },
+    parking: { name: parkingName, timezone: tz, phone, direction },
     ticket: {
       id: row.id,
       plate: row.plate,
