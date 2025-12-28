@@ -99,6 +99,36 @@ router.post('/',requireAuth(), async (req,res)=>{
   res.json(ticket);
 });
 
+// Estimación server-side (evita un request fallido y unifica cálculo)
+router.get('/:id/estimate', requireAuth(), async (req, res) => {
+  const id = Number(req.params.id);
+  if (!id) return res.status(400).json({ error: 'ID inválido' });
+
+  const [[t]] = await pool.query(
+    `SELECT t.*, 
+      rp.perHour, rp.per30min, rp.toleranceMin, rp.nightFlat, rp.nightStartsAt, rp.nightEndsAt, rp.currency
+     FROM Ticket t
+     LEFT JOIN RatePlan rp ON rp.id=t.ratePlanId
+     WHERE t.id=?
+     LIMIT 1`,
+    [id]
+  );
+
+  if (!t) return res.status(404).json({ error: 'Ticket no encontrado' });
+  if (t.status === 'CLOSED') return res.status(400).json({ error: 'Ticket ya cerrado' });
+
+  const now = new Date();
+  const minutes = Math.max(1, Math.ceil(dayjs(now).diff(dayjs(t.checkInAt), 'minute', true)));
+
+  // Subscription tickets (al día) siempre cierran en 0
+  if (t.isSubscription) {
+    return res.json({ minutes, amount: 0 });
+  }
+
+  const amount = calcAmount(minutes, t, now);
+  return res.json({ minutes, amount: Number(amount || 0) });
+});
+
 router.post('/:id/checkout', requireAuth(), async (req, res) => {
   const id = Number(req.params.id);
   const body = req.body || {};
@@ -156,32 +186,6 @@ router.post('/:id/checkout', requireAuth(), async (req, res) => {
     };
   }
 
-  async function reconcileTicket(conn, ticketId, actorUserId) {
-    const [[t2]] = await conn.query('SELECT * FROM Ticket WHERE id=? FOR UPDATE', [ticketId]);
-    if (!t2) throw new Error('Ticket no encontrado');
-
-    const [[{ totalPaid }]] = await conn.query(
-      `SELECT COALESCE(SUM(amount),0) AS totalPaid FROM Payment WHERE ticketId=?`,
-      [ticketId]
-    );
-
-    const due = Number(t2.amount || 0);
-    const paid = Number(totalPaid || 0);
-
-    if (paid >= due) {
-      await conn.query(
-        `UPDATE Ticket SET status='CLOSED', closedBy=COALESCE(closedBy, ?) WHERE id=?`,
-        [actorUserId, ticketId]
-      );
-      return { status: 'CLOSED', totalPaid: paid, balance: +(due - paid) };
-    }
-
-    await conn.query(
-      `UPDATE Ticket SET status='PAYMENT_PENDING', closedBy=NULL WHERE id=?`,
-      [ticketId]
-    );
-    return { status: 'PAYMENT_PENDING', totalPaid: paid, balance: +(due - paid) };
-  }
 
   const conn = await pool.getConnection();
   try {
@@ -216,10 +220,10 @@ router.post('/:id/checkout', requireAuth(), async (req, res) => {
       });
     }
 
-    // Only allow initial checkout from OPEN. Further payments must use POST /tickets/:id/payments.
+    // Sin pagos pendientes: sólo se permite checkout desde OPEN.
     if (t.status !== 'OPEN') {
       await conn.rollback();
-      return res.status(400).json({ error: 'Ticket ya está en checkout. Usá pagos adicionales para completar.' });
+      return res.status(400).json({ error: 'El ticket no está abierto.' });
     }
 
     const [[rp]] = await conn.query('SELECT * FROM RatePlan WHERE id=?', [t.ratePlanId]);
@@ -274,6 +278,14 @@ router.post('/:id/checkout', requireAuth(), async (req, res) => {
       return res.status(400).json({ error: 'Debe registrar al menos un pago.' });
     }
 
+    // Sin pagos pendientes: el checkout debe cubrir el total.
+    if (Math.abs(Number(totalPayThisRequest) - Number(amountDue)) > 0.001) {
+      await conn.rollback();
+      return res.status(400).json({
+        error: `Los pagos no cubren el total. Total=${amountDue} Pagos=${totalPayThisRequest}`,
+      });
+    }
+
     // Insert all payments
     const paymentIds = [];
     for (const p of payLines) {
@@ -285,7 +297,10 @@ router.post('/:id/checkout', requireAuth(), async (req, res) => {
       paymentIds.push(r.insertId);
     }
 
-    const r = await reconcileTicket(conn, id, userId);
+    await conn.query(
+      `UPDATE Ticket SET status='CLOSED', closedBy=? WHERE id=?`,
+      [userId, id]
+    );
 
     await conn.commit();
 
@@ -294,9 +309,9 @@ router.post('/:id/checkout', requireAuth(), async (req, res) => {
       ticketId: id,
       amount: amountDue,
       minutes,
-      status: r.status,
-      totalPaid: r.totalPaid,
-      balance: r.balance,
+      status: 'CLOSED',
+      totalPaid: amountDue,
+      balance: 0,
       paymentIds,
       checkedOutAt: checkOut.toISOString(),
     });
@@ -309,123 +324,6 @@ router.post('/:id/checkout', requireAuth(), async (req, res) => {
   }
 });
 
-// Agregar pagos a un ticket ya checkouteado (PAYMENT_PENDING)
-router.post('/:id/payments', requireAuth(), async (req, res) => {
-  const id = Number(req.params.id);
-  const body = req.body || {};
-  const userId = req.user?.id || null;
-
-  if (!id) return res.status(400).json({ error: 'ID inválido' });
-
-  const METHOD_OK = ['CASH', 'DEBIT', 'CREDIT', 'TRANSFER'];
-
-  function validateAndPreparePayment(p) {
-    const method = String(p?.method || '').toUpperCase();
-    if (!METHOD_OK.includes(method) || !isValidPaymentMethod(method)) throw new Error('Método de pago inválido');
-
-    const amount = Number(p?.amount);
-    if (!Number.isFinite(amount) || amount <= 0) throw new Error('Importe inválido');
-
-    let amountGiven = null;
-    let changeAmt = null;
-
-    if (method === 'CASH') {
-      if (p?.amountGiven != null && p.amountGiven !== '') {
-        amountGiven = Number(p.amountGiven);
-        if (!Number.isFinite(amountGiven) || amountGiven < amount) {
-          throw new Error('Importe recibido insuficiente');
-        }
-        changeAmt = +(amountGiven - amount);
-      }
-    }
-
-    return {
-      method,
-      amount,
-      amountGiven,
-      changeAmt,
-      externalId: p?.externalId || null,
-      note: p?.note || null,
-    };
-  }
-
-  async function reconcileTicket(conn, ticketId, actorUserId) {
-    const [[t2]] = await conn.query('SELECT * FROM Ticket WHERE id=? FOR UPDATE', [ticketId]);
-    if (!t2) throw new Error('Ticket no encontrado');
-
-    const [[{ totalPaid }]] = await conn.query(
-      `SELECT COALESCE(SUM(amount),0) AS totalPaid FROM Payment WHERE ticketId=?`,
-      [ticketId]
-    );
-
-    const due = Number(t2.amount || 0);
-    const paid = Number(totalPaid || 0);
-
-    if (paid >= due) {
-      await conn.query(
-        `UPDATE Ticket SET status='CLOSED', closedBy=COALESCE(closedBy, ?) WHERE id=?`,
-        [actorUserId, ticketId]
-      );
-      return { status: 'CLOSED', totalPaid: paid, balance: +(due - paid) };
-    }
-
-    await conn.query(
-      `UPDATE Ticket SET status='PAYMENT_PENDING', closedBy=NULL WHERE id=?`,
-      [ticketId]
-    );
-    return { status: 'PAYMENT_PENDING', totalPaid: paid, balance: +(due - paid) };
-  }
-
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-
-    const [[t]] = await conn.query('SELECT * FROM Ticket WHERE id=? FOR UPDATE', [id]);
-    if (!t) { await conn.rollback(); return res.status(404).json({ error: 'Ticket no encontrado' }); }
-    if (t.status === 'CLOSED') { await conn.rollback(); return res.status(400).json({ error: 'Ticket ya cerrado' }); }
-    if (t.status !== 'PAYMENT_PENDING') {
-      await conn.rollback();
-      return res.status(400).json({ error: 'El ticket no está pendiente de pago.' });
-    }
-
-    if (!t.checkOutAt || t.amount == null) {
-      await conn.rollback();
-      return res.status(400).json({ error: 'El ticket no tiene checkout registrado.' });
-    }
-
-    let p;
-    try {
-      p = validateAndPreparePayment(body);
-    } catch (e) {
-      await conn.rollback();
-      return res.status(400).json({ error: String(e.message || e) });
-    }
-
-    const [r] = await conn.query(
-      `INSERT INTO Payment (ticketId, method, amount, amountGiven, changeAmt, externalId, createdBy, note)
-       VALUES (?,?,?,?,?,?,?,?)`,
-      [id, p.method, p.amount, p.amountGiven, p.changeAmt, p.externalId, userId, p.note]
-    );
-
-    const rr = await reconcileTicket(conn, id, userId);
-
-    await conn.commit();
-    return res.json({
-      ok: true,
-      ticketId: id,
-      paymentId: r.insertId,
-      status: rr.status,
-      totalPaid: rr.totalPaid,
-      balance: rr.balance,
-    });
-  } catch (e) {
-    await conn.rollback();
-    console.error('[add payment error]', e);
-    return res.status(500).json({ error: 'Error agregando pago' });
-  } finally {
-    conn.release();
-  }
-});
 
 // Lookup rápido por código (para caja / scan de QR)
 router.get('/by-code/:code', requireAuth(), async (req, res) => {

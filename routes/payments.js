@@ -5,36 +5,6 @@ const { isValidPaymentMethod, normalizePaymentMethod, methodToBox } = require('.
 
 const METHOD_OK = ['CASH', 'DEBIT', 'CREDIT', 'TRANSFER'];
 
-async function reconcileTicket(conn, ticketId, actorUserId) {
-  const [[t]] = await conn.query('SELECT * FROM Ticket WHERE id=? FOR UPDATE', [ticketId]);
-  if (!t) throw new Error('Ticket no encontrado');
-
-  // Only reconcile tickets with a frozen amount (checked out)
-  if (t.amount == null) return { status: t.status, totalPaid: 0, balance: null };
-
-  const [[{ totalPaid }]] = await conn.query(
-    `SELECT COALESCE(SUM(amount),0) AS totalPaid FROM Payment WHERE ticketId=?`,
-    [ticketId]
-  );
-
-  const due = Number(t.amount || 0);
-  const paid = Number(totalPaid || 0);
-
-  if (paid >= due) {
-    await conn.query(
-      `UPDATE Ticket SET status='CLOSED', closedBy=COALESCE(closedBy, ?) WHERE id=?`,
-      [actorUserId, ticketId]
-    );
-    return { status: 'CLOSED', totalPaid: paid, balance: +(due - paid) };
-  }
-
-  await conn.query(
-    `UPDATE Ticket SET status='PAYMENT_PENDING', closedBy=NULL WHERE id=?`,
-    [ticketId]
-  );
-
-  return { status: 'PAYMENT_PENDING', totalPaid: paid, balance: +(due - paid) };
-}
 
 function validatePaymentInput(input) {
   const method = String(input?.method || '').toUpperCase();
@@ -71,6 +41,11 @@ router.post('/', requireAuth(), async (req,res)=>{
   const { ticketId, subscriberId } = req.body || {};
   const userId = req.user?.id || null;
 
+  // Pagos de tickets se registran exclusivamente en /tickets/:id/checkout.
+  if (ticketId != null) {
+    return res.status(400).json({ error: 'Los pagos de tickets se registran en el checkout del ticket.' });
+  }
+
   let p;
   try {
     p = validatePaymentInput(req.body);
@@ -88,16 +63,11 @@ router.post('/', requireAuth(), async (req,res)=>{
       [ticketId ?? null, subscriberId ?? null, p.method, p.amount, p.amountGiven, p.changeAmt, userId, p.externalId, p.note]
     );
 
-    let reconcile = null;
-    if (ticketId) {
-      reconcile = await reconcileTicket(conn, Number(ticketId), userId);
-    }
-
     await conn.commit();
 
     const [[row0]] = await pool.query('SELECT * FROM Payment WHERE id=?', [r.insertId]);
     const row = row0 ? { ...row0, method: normalizePaymentMethod(row0.method) || row0.method } : row0;
-    res.json({ ok:true, payment: row, ticket: reconcile });
+    res.json({ ok:true, payment: row });
   } catch (e) {
     await conn.rollback();
     console.error('[payments.create]', e);
